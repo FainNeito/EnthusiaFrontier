@@ -1,6 +1,7 @@
 package net.enthusia.frontier.adapter.bukkit;
 
 import java.time.Duration;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -20,6 +21,7 @@ import net.enthusia.frontier.application.FrontierRepository;
 import net.enthusia.frontier.application.RegionReclaimResult;
 import net.enthusia.frontier.application.SafetyLatch;
 import net.enthusia.frontier.config.CleanupSettings;
+import net.enthusia.frontier.adapter.paper.McaRegionFileInspector;
 import net.enthusia.frontier.domain.ChunkKey;
 import net.enthusia.frontier.domain.RegionKey;
 import org.bukkit.World;
@@ -103,38 +105,40 @@ public final class BukkitCleanupCoordinator implements AutoCloseable {
         if (safetyLatch.isTripped() || !scanRunning.compareAndSet(false, true)) {
             return;
         }
-        Map<String, String> worlds = snapshotWorlds();
+        Map<String, WorldStorage> worlds = snapshotWorlds();
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> scan(worlds));
     }
 
-    private Map<String, String> snapshotWorlds() {
-        Map<String, String> worlds = new HashMap<>();
+    private record WorldStorage(String uuid, Path folder) {}
+
+    private Map<String, WorldStorage> snapshotWorlds() {
+        Map<String, WorldStorage> worlds = new HashMap<>();
         for (String worldName : managedWorldNames) {
             World world = plugin.getServer().getWorld(worldName);
             if (world != null) {
-                worlds.put(worldName, world.getUID().toString());
+                worlds.put(worldName, new WorldStorage(world.getUID().toString(), world.getWorldFolder().toPath()));
             }
         }
         return Map.copyOf(worlds);
     }
 
-    private void scan(Map<String, String> worlds) {
+    private void scan(Map<String, WorldStorage> worlds) {
         List<CandidateWork> discoveredCandidates = new ArrayList<>();
         List<RegionWork> discoveredRegions = new ArrayList<>();
         try {
             Instant observedAt = Instant.now();
             Instant cutoff = observedAt.minus(Duration.ofDays(settings.untouchedRetentionDays()));
-            for (Map.Entry<String, String> world : worlds.entrySet()) {
+            for (var world : worlds.entrySet()) {
                 List<CleanupCandidate> found = settings.dryRun()
-                        ? repository.findCleanupCandidates(world.getValue(), cutoff, settings.candidateBatchSize())
+                        ? repository.findCleanupCandidates(world.getValue().uuid(), cutoff, settings.candidateBatchSize())
                         : repository.reserveCleanupCandidates(
-                                world.getValue(), cutoff, settings.candidateBatchSize(), observedAt);
+                                world.getValue().uuid(), cutoff, settings.candidateBatchSize(), observedAt);
                 for (CleanupCandidate candidate : found) {
                     discoveredCandidates.add(new CandidateWork(world.getKey(), candidate));
                 }
                 if (settings.physicalReclaim() && !settings.dryRun()) {
-                    for (RegionKey region : repository.findDeletedRegions(
-                            world.getValue(), settings.candidateBatchSize())) {
+                    var batch = repository.findDeletedRegions(world.getValue().uuid(), settings.candidateBatchSize());
+                    for (RegionKey region : McaRegionFileInspector.reclaimCandidates(world.getValue().folder(), batch)) {
                         discoveredRegions.add(new RegionWork(world.getKey(), region));
                     }
                 }
