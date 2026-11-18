@@ -143,6 +143,7 @@ public final class MoonriseStorageReclaimAdapter implements StorageReclaimPort {
                     case OCCUPIED -> { return RegionReclaimResult.NOT_EMPTY; }
                     case EMPTY -> emptyStores.add(type);
                     case ABSENT -> { }
+                    default -> throw new IllegalStateException("Unknown region contents");
                 }
             }
         }
@@ -163,6 +164,7 @@ public final class MoonriseStorageReclaimAdapter implements StorageReclaimPort {
                         Path file = folder.resolve(McaRegionFileInspector.regionName(region.x(), region.z()));
                         if (Files.deleteIfExists(file)) deletedAny = true;
                     }
+                    default -> throw new IllegalStateException("Unknown region contents");
                 }
             }
         }

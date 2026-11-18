@@ -4,7 +4,7 @@ import java.time.Duration;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.stream.Collectors;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -109,17 +109,17 @@ public final class BukkitCleanupCoordinator implements AutoCloseable {
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> scan(worlds));
     }
 
-    private record WorldStorage(String uuid, Path folder) {}
+    private record WorldStorage(String uuid, Path folder) {
+        static WorldStorage of(World world) {
+            return new WorldStorage(world.getUID().toString(), world.getWorldFolder().toPath());
+        }
+    }
 
     private Map<String, WorldStorage> snapshotWorlds() {
-        Map<String, WorldStorage> worlds = new HashMap<>();
-        for (String worldName : managedWorldNames) {
-            World world = plugin.getServer().getWorld(worldName);
-            if (world != null) {
-                worlds.put(worldName, new WorldStorage(world.getUID().toString(), world.getWorldFolder().toPath()));
-            }
-        }
-        return Map.copyOf(worlds);
+        return managedWorldNames.stream()
+                .map(name -> plugin.getServer().getWorld(name))
+                .filter(Objects::nonNull)
+                .collect(Collectors.toUnmodifiableMap(World::getName, WorldStorage::of));
     }
 
     private void scan(Map<String, WorldStorage> worlds) {
@@ -129,19 +129,7 @@ public final class BukkitCleanupCoordinator implements AutoCloseable {
             Instant observedAt = Instant.now();
             Instant cutoff = observedAt.minus(Duration.ofDays(settings.untouchedRetentionDays()));
             for (var world : worlds.entrySet()) {
-                List<CleanupCandidate> found = settings.dryRun()
-                        ? repository.findCleanupCandidates(world.getValue().uuid(), cutoff, settings.candidateBatchSize())
-                        : repository.reserveCleanupCandidates(
-                                world.getValue().uuid(), cutoff, settings.candidateBatchSize(), observedAt);
-                for (CleanupCandidate candidate : found) {
-                    discoveredCandidates.add(new CandidateWork(world.getKey(), candidate));
-                }
-                if (settings.physicalReclaim() && !settings.dryRun()) {
-                    var batch = repository.findDeletedRegions(world.getValue().uuid(), settings.candidateBatchSize());
-                    for (RegionKey region : McaRegionFileInspector.reclaimCandidates(world.getValue().folder(), batch)) {
-                        discoveredRegions.add(new RegionWork(world.getKey(), region));
-                    }
-                }
+                scanWorld(world.getKey(), world.getValue(), observedAt, cutoff, discoveredCandidates, discoveredRegions);
             }
         } catch (Exception exception) {
             safetyLatch.trip("frontier cleanup candidate scan failed: " + exception.getClass().getSimpleName());
@@ -158,6 +146,23 @@ public final class BukkitCleanupCoordinator implements AutoCloseable {
                 }
             }
             scanRunning.set(false);
+        }
+    }
+
+    private void scanWorld(String name, WorldStorage world, Instant observedAt, Instant cutoff,
+                           List<CandidateWork> discoveredCandidates, List<RegionWork> discoveredRegions) throws Exception {
+        List<CleanupCandidate> found = settings.dryRun()
+                ? repository.findCleanupCandidates(world.uuid(), cutoff, settings.candidateBatchSize())
+                : repository.reserveCleanupCandidates(
+                        world.uuid(), cutoff, settings.candidateBatchSize(), observedAt);
+        for (CleanupCandidate candidate : found) {
+            discoveredCandidates.add(new CandidateWork(name, candidate));
+        }
+        if (settings.physicalReclaim() && !settings.dryRun()) {
+            var batch = repository.findDeletedRegions(world.uuid(), settings.candidateBatchSize());
+            for (RegionKey region : McaRegionFileInspector.reclaimCandidates(world.folder(), batch)) {
+                discoveredRegions.add(new RegionWork(name, region));
+            }
         }
     }
 

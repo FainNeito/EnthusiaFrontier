@@ -36,54 +36,82 @@ public final class McaRegionFileInspector {
     public static List<RegionKey> reclaimCandidates(Path worldFolder, List<RegionKey> candidates)
             throws IOException {
         if (candidates.isEmpty()) return List.of();
-        var byPrefix = new HashMap<String, RegionKey>();
-        for (RegionKey key : candidates) {
-            byPrefix.put("r." + key.x() + "." + key.z(), key);
-        }
-        Set<RegionKey> existing = new HashSet<>();
-        Set<RegionKey> occupied = new HashSet<>();
-        Set<RegionKey> needsLiveCheck = new HashSet<>();
+        CandidateBatch batch = new CandidateBatch(candidates);
         for (String storage : List.of("region", "entities", "poi")) {
             Path folder = worldFolder.resolve(storage);
-            if (Files.notExists(folder, LinkOption.NOFOLLOW_LINKS)) continue;
-            if (!Files.isDirectory(folder, LinkOption.NOFOLLOW_LINKS)) {
-                throw new IOException("Invalid region storage directory: " + folder);
-            }
-            try (var entries = Files.newDirectoryStream(folder)) {
-                for (Path entry : entries) {
-                    String name = entryName(entry);
-                    if (name.startsWith("c.")) {
-                        Matcher sidecar = EXTERNAL_CHUNK.matcher(name);
-                        if (sidecar.matches()) {
-                            int x = Integer.parseInt(sidecar.group(1)) >> 5;
-                            int z = Integer.parseInt(sidecar.group(2)) >> 5;
-                            RegionKey key = byPrefix.get("r." + x + "." + z);
-                            if (key != null) occupied.add(key);
-                        }
-                        continue;
-                    }
-                    Matcher container = REGION_ENTRY.matcher(name);
-                    if (!container.matches()) continue;
-                    RegionKey key = byPrefix.get(container.group(1));
-                    if (key == null) continue;
-                    if (!container.group(2).equals("mca")) {
-                        needsLiveCheck.add(key);
-                        continue;
-                    }
-                    existing.add(key);
-                    if (!occupied.contains(key)) {
-                        try {
-                            if (hasOccupiedHeader(entry)) occupied.add(key);
-                        } catch (IOException ignored) {
-                            // A concurrent create/remove or an invalid header requires live validation.
-                            needsLiveCheck.add(key);
-                        }
-                    }
+            if (storageExists(folder)) {
+                try (var entries = Files.newDirectoryStream(folder)) {
+                    for (Path entry : entries) batch.inspect(entry);
                 }
             }
         }
-        return candidates.stream().filter(key -> needsLiveCheck.contains(key)
-                || (existing.contains(key) && !occupied.contains(key))).toList();
+        return candidates.stream().filter(batch::requiresLiveCheck).toList();
+    }
+
+    private static boolean storageExists(Path folder) throws IOException {
+        if (Files.notExists(folder, LinkOption.NOFOLLOW_LINKS)) return false;
+        if (!Files.isDirectory(folder, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Invalid region storage directory: " + folder);
+        }
+        return true;
+    }
+
+    private static String prefix(int x, int z) {
+        return "r." + x + "." + z;
+    }
+
+    private static final class CandidateBatch {
+        private final HashMap<String, RegionKey> byPrefix = new HashMap<>();
+        private final Set<RegionKey> existing = new HashSet<>();
+        private final Set<RegionKey> occupied = new HashSet<>();
+        private final Set<RegionKey> needsLiveCheck = new HashSet<>();
+
+        CandidateBatch(List<RegionKey> candidates) {
+            for (RegionKey key : candidates) byPrefix.put(prefix(key.x(), key.z()), key);
+        }
+
+        boolean requiresLiveCheck(RegionKey key) {
+            return needsLiveCheck.contains(key) || (existing.contains(key) && !occupied.contains(key));
+        }
+
+        void inspect(Path entry) throws IOException {
+            String name = entryName(entry);
+            if (name.startsWith("c.")) {
+                Matcher match = EXTERNAL_CHUNK.matcher(name);
+                if (match.matches()) {
+                    RegionKey key = byPrefix.get(prefix(regionCoordinate(match, 1), regionCoordinate(match, 2)));
+                    if (key != null) occupied.add(key);
+                }
+                return;
+            }
+            Matcher match = REGION_ENTRY.matcher(name);
+            if (match.matches()) {
+                RegionKey key = byPrefix.get(match.group(1));
+                if (key != null) inspectContainer(entry, key, match.group(2));
+            }
+        }
+
+        private void inspectContainer(Path entry, RegionKey key, String extension) {
+            if (!extension.equals("mca")) {
+                needsLiveCheck.add(key);
+                return;
+            }
+            existing.add(key);
+            try {
+                if (!occupied.contains(key) && hasOccupiedHeader(entry)) occupied.add(key);
+            } catch (IOException ignored) {
+                // Let the live storage check handle a changed or unreadable header.
+                needsLiveCheck.add(key);
+            }
+        }
+    }
+
+    private static int regionCoordinate(Matcher match, int group) throws IOException {
+        try {
+            return Integer.parseInt(match.group(group)) >> 5;
+        } catch (NumberFormatException invalid) {
+            throw new IOException("Invalid external chunk coordinate", invalid);
+        }
     }
 
     private static String entryName(Path entry) throws IOException {
@@ -104,25 +132,33 @@ public final class McaRegionFileInspector {
 
     /** Fresh check immediately before unlink; never uses the discovery result as evidence of emptiness. */
     static Contents inspectForReclaim(Path folder, RegionKey region) throws IOException {
-        if (Files.notExists(folder, LinkOption.NOFOLLOW_LINKS)) return Contents.ABSENT;
-        if (!Files.isDirectory(folder, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Invalid storage: " + folder);
-        String prefix = "r." + region.x() + "." + region.z() + ".";
-        String mca = prefix + "mca";
+        if (!storageExists(folder)) return Contents.ABSENT;
+        String prefix = prefix(region.x(), region.z()) + ".";
+        String mca = regionName(region.x(), region.z());
+        Contents entries = inspectEntries(folder, region, prefix, mca);
+        if (entries != Contents.EMPTY) return entries;
+        Path file = folder.resolve(mca);
+        if (Files.notExists(file, LinkOption.NOFOLLOW_LINKS)) return Contents.ABSENT;
+        return hasOccupiedHeader(file) ? Contents.OCCUPIED : Contents.EMPTY;
+    }
+
+    private static Contents inspectEntries(Path folder, RegionKey region, String prefix, String mca) throws IOException {
         boolean sidecarPresent = false;
         try (var entries = Files.newDirectoryStream(folder)) {
             for (Path entry : entries) {
                 String name = entryName(entry);
                 if (name.startsWith(prefix) && !name.equals(mca)) return Contents.UNSUPPORTED;
-                if (!name.startsWith("c.")) continue;
-                Matcher match = EXTERNAL_CHUNK.matcher(name);
-                if (match.matches() && (Integer.parseInt(match.group(1)) >> 5) == region.x()
-                        && (Integer.parseInt(match.group(2)) >> 5) == region.z()) sidecarPresent = true;
+                if (isSidecarFor(name, region)) sidecarPresent = true;
             }
         }
-        if (sidecarPresent) return Contents.OCCUPIED;
-        Path file = folder.resolve(mca);
-        if (Files.notExists(file, LinkOption.NOFOLLOW_LINKS)) return Contents.ABSENT;
-        return hasOccupiedHeader(file) ? Contents.OCCUPIED : Contents.EMPTY;
+        return sidecarPresent ? Contents.OCCUPIED : Contents.EMPTY;
+    }
+
+    private static boolean isSidecarFor(String name, RegionKey region) throws IOException {
+        if (!name.startsWith("c.")) return false;
+        Matcher match = EXTERNAL_CHUNK.matcher(name);
+        return match.matches() && regionCoordinate(match, 1) == region.x()
+                && regionCoordinate(match, 2) == region.z();
     }
 
     public static boolean containsChunk(Path regionFile, int chunkX, int chunkZ) throws IOException {

@@ -14,14 +14,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class McaRegionFileInspectorTest {
+    private static final String WORLD = "world";
     @TempDir
     Path temporaryDirectory;
 
     @Test
     void batchScreenSkipsAbsentAndOccupiedRegionsAndKeepsEmptyCandidates() throws Exception {
-        var absent = new RegionKey("world", 0, 0);
-        var empty = new RegionKey("world", -1, -1);
-        var occupied = new RegionKey("world", 1, 1);
+        var absent = new RegionKey(WORLD, 0, 0);
+        var empty = new RegionKey(WORLD, -1, -1);
+        var occupied = new RegionKey(WORLD, 1, 1);
         Path region = Files.createDirectory(temporaryDirectory.resolve("region"));
         Files.write(region.resolve("r.-1.-1.mca"), new byte[8192]);
         byte[] header = new byte[8192];
@@ -38,7 +39,7 @@ class McaRegionFileInspectorTest {
 
     @Test
     void liveCheckDetectsChangesAfterDiscovery() throws Exception {
-        var region = new RegionKey("world", 0, 0);
+        var region = new RegionKey(WORLD, 0, 0);
         Path folder = Files.createDirectory(temporaryDirectory.resolve("region"));
         Path file = folder.resolve("r.0.0.mca");
         byte[] header = new byte[McaRegionFileInspector.HEADER_BYTES];
