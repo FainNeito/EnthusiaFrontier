@@ -20,6 +20,7 @@ import net.enthusia.frontier.adapter.bukkit.BukkitViewDistanceAdapter;
 import net.enthusia.frontier.adapter.bukkit.FrontierAcceptanceHarness;
 import net.enthusia.frontier.adapter.bukkit.FrontierGenerationLoadHarness;
 import net.enthusia.frontier.adapter.bukkit.FrontierListener;
+import net.enthusia.frontier.adapter.bukkit.LumaClaimLookup;
 import net.enthusia.frontier.adapter.bukkit.GenerationShieldMovementListener;
 import net.enthusia.frontier.adapter.paper.MoonriseStorageReclaimAdapter;
 import net.enthusia.frontier.adapter.paper.PaperChunkGenerationAdapter;
@@ -81,6 +82,7 @@ public final class EnthusiaFrontierPlugin extends JavaPlugin {
     private BukkitTask viewDistanceTask;
     private BukkitPerformanceEvidenceMonitor evidenceMonitor;
     private BukkitCleanupCoordinator cleanupCoordinator;
+    private LumaClaimLookup claimLookup;
     private FrontierAcceptanceHarness acceptanceHarness;
     private FrontierGenerationLoadHarness generationLoadHarness;
     private SqliteGenerationReadinessAdapter generationReadiness;
@@ -168,6 +170,13 @@ public final class EnthusiaFrontierPlugin extends JavaPlugin {
         if (cleanupCoordinator != null) {
             cleanupCoordinator.close();
             cleanupCoordinator = null;
+        }
+        if (claimLookup != null) {
+            try {
+                claimLookup.close();
+            } catch (SQLException exception) {
+                getLogger().log(Level.WARNING, "Closing LumaGuilds claim lookup failed", exception);
+            }
         }
         if (throttleTask != null) {
             throttleTask.cancel();
@@ -365,6 +374,11 @@ public final class EnthusiaFrontierPlugin extends JavaPlugin {
     }
 
     private void initializeCleanup(FrontierTrackingService tracking) throws Exception {
+        if (settings.cleanup().enabled() && settings.cleanup().dryRun()) {
+            cleanupAdapterMode = "read-only";
+            startCleanupCoordinator(tracking, null);
+            return;
+        }
         if (isMockBukkitRuntime()) {
             cleanupAdapterMode = "simulation-unavailable";
             if (settings.cleanup().enabled() && settings.cleanup().requireSupportedAdapter()) {
@@ -400,12 +414,34 @@ public final class EnthusiaFrontierPlugin extends JavaPlugin {
             throw new IllegalStateException("configured physical cleanup is unsupported by this storage adapter");
         }
 
+        startCleanupCoordinator(tracking, storage);
+    }
+
+    private void startCleanupCoordinator(FrontierTrackingService tracking, StorageReclaimPort storage) throws SQLException {
+        var guilds = getServer().getPluginManager().getPlugin("LumaGuilds");
+        boolean requireClaims = getConfig().getBoolean("cleanup.require-lumaguilds", false);
+        if (guilds != null || requireClaims) {
+            if (guilds == null || !guilds.isEnabled()
+                    || !"sqlite".equalsIgnoreCase(guilds.getConfig().getString("database_type", "sqlite"))) {
+                throw new IllegalStateException("Cleanup requires an enabled LumaGuilds SQLite claim source");
+            }
+            claimLookup = new LumaClaimLookup(
+                    guilds.getDataFolder().toPath().resolve("lumaguilds.db"));
+        }
         CleanupService cleanupService = new CleanupService(
                 settings.cleanup(),
                 tracking,
                 mutationJournal,
                 safetyLatch,
-                new BukkitCleanupEnvironmentAdapter(getServer()),
+                new BukkitCleanupEnvironmentAdapter(getServer(), key -> {
+                    if (claimLookup == null) {
+                        return false;
+                    }
+                    if (!guilds.isEnabled()) {
+                        throw new IllegalStateException("LumaGuilds disabled during cleanup");
+                    }
+                    return claimLookup.isClaimed(key);
+                }),
                 storage,
                 Clock.systemUTC(),
                 settings.cleanup().auditLog() ? getLogger()::info : ignored -> { },

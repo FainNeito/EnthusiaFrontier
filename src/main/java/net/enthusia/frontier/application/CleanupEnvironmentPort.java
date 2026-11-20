@@ -6,5 +6,9 @@ import net.enthusia.frontier.domain.ChunkKey;
 public interface CleanupEnvironmentPort {
     double recentMspt();
 
+    default boolean isClaimed(ChunkKey key) {
+        return false;
+    }
+
     boolean isSafeToClear(String worldName, ChunkKey key, int minimumPlayerDistanceChunks);
 }

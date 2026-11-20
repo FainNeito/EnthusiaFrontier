@@ -48,7 +48,7 @@ public final class CleanupService {
         this.journal = Objects.requireNonNull(journal, "journal");
         this.safetyLatch = Objects.requireNonNull(safetyLatch, "safetyLatch");
         this.environment = Objects.requireNonNull(environment, "environment");
-        this.storage = Objects.requireNonNull(storage, "storage");
+        this.storage = settings.dryRun() ? null : Objects.requireNonNull(storage, "storage");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.auditSink = Objects.requireNonNull(auditSink, "auditSink");
         this.deletedChunkSink = Objects.requireNonNull(deletedChunkSink, "deletedChunkSink");
@@ -73,6 +73,10 @@ public final class CleanupService {
         }
         if (tracking.isProtectedInMemory(key)) {
             auditDecision(worldName, candidate, "protected", "player_activity");
+            return CleanupResult.PROTECTED;
+        }
+        if (environment.isClaimed(key)) {
+            auditDecision(worldName, candidate, "protected", "land_claim");
             return CleanupResult.PROTECTED;
         }
         if (!environment.isSafeToClear(worldName, key, settings.minPlayerDistanceChunks())) {

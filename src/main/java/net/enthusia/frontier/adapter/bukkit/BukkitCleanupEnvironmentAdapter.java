@@ -2,6 +2,7 @@ package net.enthusia.frontier.adapter.bukkit;
 
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Predicate;
 import net.enthusia.frontier.application.CleanupEnvironmentPort;
 import net.enthusia.frontier.config.GenerationShieldSettings;
 import net.enthusia.frontier.domain.ChunkKey;
@@ -13,9 +14,21 @@ import org.bukkit.entity.Player;
 /** Immediate Bukkit safety checks performed on the server thread before deletion. */
 public final class BukkitCleanupEnvironmentAdapter implements CleanupEnvironmentPort {
     private final Server server;
+    private final Predicate<ChunkKey> claimLookup;
 
     public BukkitCleanupEnvironmentAdapter(Server server) {
+        this(server, ignored -> false);
+    }
+
+
+    public BukkitCleanupEnvironmentAdapter(Server server, Predicate<ChunkKey> claimLookup) {
         this.server = Objects.requireNonNull(server, "server");
+        this.claimLookup = Objects.requireNonNull(claimLookup, "claimLookup");
+    }
+
+    @Override
+    public boolean isClaimed(ChunkKey key) {
+        return claimLookup.test(key);
     }
 
     @Override
