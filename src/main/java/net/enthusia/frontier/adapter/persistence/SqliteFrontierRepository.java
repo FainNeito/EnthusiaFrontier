@@ -324,19 +324,29 @@ public final class SqliteFrontierRepository implements FrontierRepository, AutoC
     }
 
     /** A null cutoff selects pending recovery work, regardless of its generation age. */
+    private static final String PAGE_SELECT =
+            "SELECT chunk_x, chunk_z, generated_at_ms, reclaim_intent_at_ms FROM frontier_chunk "
+                    + "WHERE world_uuid = ? AND protected = 0 AND deleted_at_ms IS NULL AND ";
+    private static final String RECOVERY_SELECT = PAGE_SELECT + "reclaim_intent_at_ms IS NOT NULL";
+    private static final String FRESH_SELECT = PAGE_SELECT + "reclaim_intent_at_ms IS NULL AND generated_at_ms <= ?";
+    private static final String RECOVERY_ORDER = "reclaim_intent_at_ms, chunk_x, chunk_z";
+    private static final String FRESH_ORDER = "generated_at_ms, chunk_x, chunk_z";
+    private static final String RECOVERY_PAGE = " ORDER BY " + RECOVERY_ORDER + " LIMIT ?";
+    private static final String FRESH_PAGE = " ORDER BY " + FRESH_ORDER + " LIMIT ?";
+
     private static List<CleanupCandidate> readPage(Connection active, String worldUuid, Instant cutoff,
                                                    CleanupCandidate after, int limit) throws SQLException {
         boolean recovery = cutoff == null;
-        String timestamp = recovery ? "reclaim_intent_at_ms" : "generated_at_ms";
-        String order = timestamp + ", chunk_x, chunk_z";
-        String eligibility = recovery ? "reclaim_intent_at_ms IS NOT NULL"
-                : "reclaim_intent_at_ms IS NULL AND generated_at_ms <= ?";
-        String continuation = after == null ? "" : " AND (" + order + ") > (?, ?, ?)";
         List<CleanupCandidate> result = new ArrayList<>(limit);
-        try (PreparedStatement statement = active.prepareStatement(
-                "SELECT chunk_x, chunk_z, generated_at_ms, reclaim_intent_at_ms FROM frontier_chunk "
-                        + "WHERE world_uuid = ? AND protected = 0 AND deleted_at_ms IS NULL AND "
-                        + eligibility + continuation + " ORDER BY " + order + " LIMIT ?")) {
+        String query;
+        if (recovery) {
+            query = after == null ? RECOVERY_SELECT + RECOVERY_PAGE
+                    : RECOVERY_SELECT + " AND (" + RECOVERY_ORDER + ") > (?, ?, ?)" + RECOVERY_PAGE;
+        } else {
+            query = after == null ? FRESH_SELECT + FRESH_PAGE
+                    : FRESH_SELECT + " AND (" + FRESH_ORDER + ") > (?, ?, ?)" + FRESH_PAGE;
+        }
+        try (PreparedStatement statement = active.prepareStatement(query)) {
             int index = 1;
             statement.setString(index++, worldUuid);
             if (!recovery) {
