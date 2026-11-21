@@ -77,6 +77,35 @@ class SqliteFrontierRepositoryTest {
     }
 
     @Test
+    void fullSkippedBatchDoesNotStarveLaterCandidates() throws Exception {
+        Instant generated = Instant.parse("2026-01-01T00:00:00Z");
+        Instant reserved = generated.plusSeconds(120);
+        Path database = temporaryDirectory.resolve("full-batch.db");
+        var wilderness = new ChunkKey("world", 128, 0);
+        try (var repo = new SqliteFrontierRepository(database)) {
+            repo.initialize();
+            for (int x = 0; x <= 128; x++) {
+                repo.applyBatch(List.of(new FrontierMutation.Generated(new ChunkKey("world", x, 0), generated)));
+            }
+            assertEquals(128, repo.findCleanupCandidates("world", reserved, 128).size());
+            assertEquals(wilderness, repo.findCleanupCandidates("world", reserved, 128).getFirst().key());
+            // Ownership is checked after selection. All first-page rows stay in the ledger.
+            assertEquals(128, repo.reserveCleanupCandidates("world", reserved, 128, reserved).size());
+        }
+        try (var repo = new SqliteFrontierRepository(database)) {
+            repo.initialize();
+            var recovered = repo.reserveCleanupCandidates("world", reserved, 128, reserved.plusSeconds(1));
+            assertEquals(128, recovered.size());
+            assertTrue(recovered.stream().allMatch(row -> reserved.equals(row.reclaimIntentAt())));
+            var next = repo.reserveCleanupCandidates("world", reserved, 128, reserved.plusSeconds(2));
+            assertEquals(wilderness, next.getFirst().key());
+            repo.applyBatch(List.of(new FrontierMutation.Deleted(wilderness, reserved.plusSeconds(3))));
+            assertEquals(1, repo.stats().deletedChunks());
+            assertEquals(reserved.toEpochMilli(), reclaimIntentMillis(database, new ChunkKey("world", 0, 0)));
+        }
+    }
+
+    @Test
     void reclaimIntentIsCommittedBeforeReturnAndRecoveredAcrossRestart() throws Exception {
         Path database = temporaryDirectory.resolve("intent.db");
         ChunkKey candidateKey = new ChunkKey("world", 40, -41);

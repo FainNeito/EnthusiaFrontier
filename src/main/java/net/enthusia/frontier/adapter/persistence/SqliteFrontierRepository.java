@@ -9,8 +9,10 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import net.enthusia.frontier.application.CleanupCandidate;
@@ -25,6 +27,9 @@ public final class SqliteFrontierRepository implements FrontierRepository, AutoC
     private static final int SCHEMA_VERSION = 2;
     private static final int REGION_SCAN_MULTIPLIER = 32;
     private final Path databasePath;
+    // Scan positions are process-local. Reopening always starts with durable intents.
+    private final Map<String, CleanupCandidate> dryRunPositions = new HashMap<>();
+    private final Map<String, CleanupCandidate> reservationPositions = new HashMap<>();
     private Connection connection;
 
     public SqliteFrontierRepository(Path databasePath) {
@@ -45,6 +50,8 @@ public final class SqliteFrontierRepository implements FrontierRepository, AutoC
             statement.execute("PRAGMA busy_timeout=5000");
         }
         migrate();
+        dryRunPositions.clear();
+        reservationPositions.clear();
     }
 
     @Override
@@ -124,22 +131,9 @@ public final class SqliteFrontierRepository implements FrontierRepository, AutoC
         requirePositiveLimit(limit);
         Objects.requireNonNull(worldUuid, "worldUuid");
         Objects.requireNonNull(cutoff, "cutoff");
-        List<CleanupCandidate> result = new ArrayList<>(limit);
-        try (PreparedStatement statement = requireConnection().prepareStatement(
-                "SELECT chunk_x, chunk_z, generated_at_ms FROM frontier_chunk "
-                        + "WHERE world_uuid = ? AND protected = 0 AND deleted_at_ms IS NULL "
-                        + "AND reclaim_intent_at_ms IS NULL AND generated_at_ms <= ? "
-                        + "ORDER BY generated_at_ms, chunk_x, chunk_z LIMIT ?")) {
-            statement.setString(1, worldUuid);
-            statement.setLong(2, cutoff.toEpochMilli());
-            statement.setInt(3, limit);
-            try (ResultSet rows = statement.executeQuery()) {
-                while (rows.next()) {
-                    ChunkKey key = new ChunkKey(worldUuid, rows.getInt(1), rows.getInt(2));
-                    result.add(new CleanupCandidate(key, Instant.ofEpochMilli(rows.getLong(3))));
-                }
-            }
-        }
+        List<CleanupCandidate> result = readPage(requireConnection(), worldUuid, cutoff,
+                dryRunPositions.get(worldUuid), limit);
+        advance(dryRunPositions, worldUuid, result, limit);
         return List.copyOf(result);
     }
 
@@ -154,10 +148,17 @@ public final class SqliteFrontierRepository implements FrontierRepository, AutoC
         boolean originalAutoCommit = active.getAutoCommit();
         active.setAutoCommit(false);
         try {
-            List<CleanupCandidate> result = existingIntents(active, worldUuid, limit);
-            int remaining = limit - result.size();
+            CleanupCandidate position = reservationPositions.get(worldUuid);
+            List<CleanupCandidate> page = new ArrayList<>(limit);
+            if (position == null || position.hasReclaimIntent()) {
+                page.addAll(readPage(active, worldUuid, null, position, limit));
+            }
+            List<CleanupCandidate> result = new ArrayList<>(page);
+            int remaining = limit - page.size();
             if (remaining > 0) {
-                List<CleanupCandidate> unreserved = unreservedCandidates(active, worldUuid, cutoff, remaining);
+                CleanupCandidate freshPosition = position != null && !position.hasReclaimIntent() ? position : null;
+                List<CleanupCandidate> unreserved = readPage(active, worldUuid, cutoff, freshPosition, remaining);
+                page.addAll(unreserved);
                 try (PreparedStatement reserve = active.prepareStatement(
                         "UPDATE frontier_chunk SET reclaim_intent_at_ms = ? "
                                 + "WHERE world_uuid = ? AND chunk_x = ? AND chunk_z = ? "
@@ -173,6 +174,7 @@ public final class SqliteFrontierRepository implements FrontierRepository, AutoC
                 }
             }
             active.commit();
+            advance(reservationPositions, worldUuid, page, limit);
             return List.copyOf(result);
         } catch (SQLException | RuntimeException exception) {
             active.rollback();
@@ -312,42 +314,46 @@ public final class SqliteFrontierRepository implements FrontierRepository, AutoC
         connection = null;
     }
 
-    private static List<CleanupCandidate> existingIntents(Connection active, String worldUuid, int limit)
-            throws SQLException {
+    private static void advance(Map<String, CleanupCandidate> positions, String worldUuid,
+                                List<CleanupCandidate> page, int limit) {
+        if (page.size() == limit) {
+            positions.put(worldUuid, page.getLast());
+        } else {
+            positions.remove(worldUuid);
+        }
+    }
+
+    /** A null cutoff selects pending recovery work, regardless of its generation age. */
+    private static List<CleanupCandidate> readPage(Connection active, String worldUuid, Instant cutoff,
+                                                   CleanupCandidate after, int limit) throws SQLException {
+        boolean recovery = cutoff == null;
+        String timestamp = recovery ? "reclaim_intent_at_ms" : "generated_at_ms";
+        String order = timestamp + ", chunk_x, chunk_z";
+        String eligibility = recovery ? "reclaim_intent_at_ms IS NOT NULL"
+                : "reclaim_intent_at_ms IS NULL AND generated_at_ms <= ?";
+        String continuation = after == null ? "" : " AND (" + order + ") > (?, ?, ?)";
         List<CleanupCandidate> result = new ArrayList<>(limit);
         try (PreparedStatement statement = active.prepareStatement(
                 "SELECT chunk_x, chunk_z, generated_at_ms, reclaim_intent_at_ms FROM frontier_chunk "
-                        + "WHERE world_uuid = ? AND protected = 0 AND deleted_at_ms IS NULL "
-                        + "AND reclaim_intent_at_ms IS NOT NULL "
-                        + "ORDER BY reclaim_intent_at_ms, chunk_x, chunk_z LIMIT ?")) {
-            statement.setString(1, worldUuid);
-            statement.setInt(2, limit);
-            try (ResultSet rows = statement.executeQuery()) {
-                while (rows.next()) {
-                    ChunkKey key = new ChunkKey(worldUuid, rows.getInt(1), rows.getInt(2));
-                    result.add(new CleanupCandidate(
-                            key, Instant.ofEpochMilli(rows.getLong(3)), Instant.ofEpochMilli(rows.getLong(4))));
-                }
+                        + "WHERE world_uuid = ? AND protected = 0 AND deleted_at_ms IS NULL AND "
+                        + eligibility + continuation + " ORDER BY " + order + " LIMIT ?")) {
+            int index = 1;
+            statement.setString(index++, worldUuid);
+            if (!recovery) {
+                statement.setLong(index++, cutoff.toEpochMilli());
             }
-        }
-        return result;
-    }
-
-    private static List<CleanupCandidate> unreservedCandidates(
-            Connection active, String worldUuid, Instant cutoff, int limit) throws SQLException {
-        List<CleanupCandidate> result = new ArrayList<>(limit);
-        try (PreparedStatement statement = active.prepareStatement(
-                "SELECT chunk_x, chunk_z, generated_at_ms FROM frontier_chunk "
-                        + "WHERE world_uuid = ? AND protected = 0 AND deleted_at_ms IS NULL "
-                        + "AND reclaim_intent_at_ms IS NULL AND generated_at_ms <= ? "
-                        + "ORDER BY generated_at_ms, chunk_x, chunk_z LIMIT ?")) {
-            statement.setString(1, worldUuid);
-            statement.setLong(2, cutoff.toEpochMilli());
-            statement.setInt(3, limit);
+            if (after != null) {
+                Instant time = recovery ? after.reclaimIntentAt() : after.generatedAt();
+                statement.setLong(index++, time.toEpochMilli());
+                statement.setInt(index++, after.key().x());
+                statement.setInt(index++, after.key().z());
+            }
+            statement.setInt(index, limit);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
                     ChunkKey key = new ChunkKey(worldUuid, rows.getInt(1), rows.getInt(2));
-                    result.add(new CleanupCandidate(key, Instant.ofEpochMilli(rows.getLong(3))));
+                    result.add(new CleanupCandidate(key, Instant.ofEpochMilli(rows.getLong(3)),
+                            recovery ? Instant.ofEpochMilli(rows.getLong(4)) : null));
                 }
             }
         }
