@@ -136,6 +136,8 @@ cleanup:
   # production copy and inspect /frontier status before enabling destructive mode.
   enabled: false
   dry-run: true
+  # Require the guild claim database even when LumaGuilds is missing at startup.
+  require-lumaguilds: false
   untouched-retention-days: 30
   scan-period-ticks: 1200
   candidate-batch-size: 128
