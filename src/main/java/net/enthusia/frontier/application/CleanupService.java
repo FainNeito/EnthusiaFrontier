@@ -87,6 +87,10 @@ public final class CleanupService {
             auditDecision(worldName, candidate, "dry_run", "eligible");
             return CleanupResult.DRY_RUN;
         }
+        if (!storage.isStorageIdle(worldName, key)) {
+            auditDecision(worldName, candidate, "deferred", "pending_storage_activity");
+            return CleanupResult.DEFERRED;
+        }
         if (!candidate.hasReclaimIntent()) {
             safetyLatch.trip("destructive cleanup candidate lacked durable reclaim intent");
             auditDecision(worldName, candidate, "latched", "missing_reclaim_intent");

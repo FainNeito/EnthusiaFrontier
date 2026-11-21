@@ -23,6 +23,7 @@ import net.enthusia.frontier.adapter.bukkit.FrontierListener;
 import net.enthusia.frontier.adapter.bukkit.LumaClaimLookup;
 import net.enthusia.frontier.adapter.bukkit.GenerationShieldMovementListener;
 import net.enthusia.frontier.adapter.paper.MoonriseStorageReclaimAdapter;
+import net.enthusia.frontier.adapter.paper.Snapshot8StorageAdapter;
 import net.enthusia.frontier.adapter.paper.PaperChunkGenerationAdapter;
 import net.enthusia.frontier.adapter.paper.PaperGenerationThrottleAdapter;
 import net.enthusia.frontier.adapter.persistence.FileSafetyLatch;
@@ -389,22 +390,25 @@ public final class EnthusiaFrontierPlugin extends JavaPlugin {
 
         StorageReclaimPort storage;
         try {
-            storage = MoonriseStorageReclaimAdapter.create();
+            storage = "26.4-snapshot-8.local-SNAPSHOT".equals(getServer().getBukkitVersion())
+                    ? new Snapshot8StorageAdapter() : MoonriseStorageReclaimAdapter.create();
             cleanupAdapterMode = storage.adapterName();
         } catch (ReflectiveOperationException | RuntimeException exception) {
             cleanupAdapterMode = "unsupported";
             if (settings.cleanup().enabled() && settings.cleanup().requireSupportedAdapter()) {
                 throw new IllegalStateException(
-                        "This Paper/Leaf build does not expose Frontier's validated Moonrise storage adapter",
+                        "This Paper/Leaf build does not expose Frontier's expected storage adapter",
                         exception);
             }
             getLogger().log(Level.WARNING,
-                    "Moonrise storage adapter unavailable; destructive cleanup will remain inactive", exception);
+                    "Storage adapter unavailable; destructive cleanup will remain inactive", exception);
             return;
         }
 
-        acceptanceHarness = new FrontierAcceptanceHarness(
-                this, tracking, repository, mutationJournal, storage);
+        if (storage.supportsPhysicalReclaim()) {
+            acceptanceHarness = new FrontierAcceptanceHarness(
+                    this, tracking, repository, mutationJournal, storage);
+        }
         if (!settings.cleanup().enabled()) {
             return;
         }

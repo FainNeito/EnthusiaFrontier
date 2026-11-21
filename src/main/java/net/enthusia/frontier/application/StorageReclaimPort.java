@@ -10,6 +10,8 @@ public interface StorageReclaimPort {
 
     boolean supportsPhysicalReclaim();
 
+    default boolean isStorageIdle(String worldName, ChunkKey key) throws Exception { return true; }
+
     void clearChunk(String worldName, ChunkKey key) throws Exception;
 
     void flushWorld(String worldName, String expectedWorldUuid) throws Exception;

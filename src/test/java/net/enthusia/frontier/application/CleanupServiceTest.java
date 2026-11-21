@@ -121,6 +121,21 @@ class CleanupServiceTest {
     }
 
     @Test
+    void pendingStorageWorkDefersDeletionUntilIdle() throws Exception {
+        try (Fixture fixture = new Fixture(settings(false), 20.0, true)) {
+            CleanupCandidate candidate = fixture.candidate(true);
+            fixture.storage.idle = false;
+            assertEquals(CleanupResult.DEFERRED, fixture.service.process("world", candidate));
+            assertEquals(0, fixture.storage.clears);
+            assertTrue(fixture.forgotten.isEmpty());
+            assertTrue(fixture.repository.applied.isEmpty());
+            fixture.storage.idle = true;
+            assertEquals(CleanupResult.CLEARED, fixture.service.process("world", candidate));
+            assertEquals(1, fixture.storage.clears);
+        }
+    }
+
+    @Test
     void nearbyOrOtherwiseUnsafeEnvironmentDefersWithAuditReason() throws Exception {
         Fixture fixture = new Fixture(settings(false), 20.0, false);
         try {
@@ -240,7 +255,14 @@ class CleanupServiceTest {
     }
 
     private static final class RecordingStorage implements StorageReclaimPort {
+        private boolean idle = true;
         private int clears;
+
+        @Override
+        public boolean isStorageIdle(String worldName, ChunkKey key) {
+            return idle;
+        }
+
         private RuntimeException clearFailure;
 
         @Override
